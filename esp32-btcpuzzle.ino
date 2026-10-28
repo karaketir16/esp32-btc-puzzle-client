@@ -412,11 +412,11 @@ static void blinkKeyChecked() {
   delay(KEY_CHECK_BLINK_MS);
   rgbLedWrite(RGB_BUILTIN, 0, 0, 0);
 #elif defined(LED_BUILTIN)
-  // Some C3 Super Mini variants expose a single-color LED, not an addressable RGB LED.
+  // The Nologo C3 Super Mini's single-color onboard LED is active-low.
   pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
-  delay(KEY_CHECK_BLINK_MS);
   digitalWrite(LED_BUILTIN, LOW);
+  delay(KEY_CHECK_BLINK_MS);
+  digitalWrite(LED_BUILTIN, HIGH);
 #endif
 }
 
