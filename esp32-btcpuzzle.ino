@@ -2,11 +2,11 @@
 #ifndef SERIAL_ONLY
 #define SERIAL_ONLY 0
 #endif
-
 #if !SERIAL_ONLY
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <time.h>
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
@@ -16,627 +16,888 @@
 #define TELEGRAM_OWNER_CHAT_ID "PASTE_NUMERIC_CHAT_ID_HERE"
 #endif
 #endif
-
+#include <bootloader_random.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
-#include <mbedtls/ecp.h>
-#include <mbedtls/sha256.h>
-#include "ripemd160.h"
+#if defined(ARDUINO)
+#include <esp_partition.h>
+#endif
+#include "search_core.h"
+#include "checkpoint_store.h"
+#include "found_records.h"
+#include "run_stats.h"
+#include "selftest_vectors.h"
 #include "puzzle_metadata.h"
 
-// Override with -DSERIAL_ONLY=1 to disable Wi-Fi and Telegram at compile time.
-
-// Standalone BTC Puzzle client: reads public puzzle metadata only, never asks
-// the pool for work and never submits ranges or progress.
-static constexpr uint16_t MAX_PUZZLE_ID = 160;
-static constexpr uint32_t TELEGRAM_POLL_MS = 10000;
+static constexpr uint32_t CHECKPOINT_MS = 10000;
 static constexpr uint32_t STATS_LOG_MS = 30000;
-static constexpr uint32_t KEY_CHECK_BLINK_MS = 25;
-
+static constexpr uint32_t CHUNK_MS = 60000;
+static constexpr uint16_t SELFTEST_CHUNK_KEYS = 50;
+static constexpr uint32_t SELFTEST_CHUNK_MS = 2000;
+static constexpr uint16_t MAX_PUZZLE_ID = 160;
 struct Puzzle {
   uint16_t id = 0;
-  String startHex;
-  String endHex;
   String address;
+  uint8_t target[20] = {};
   bool loaded = false;
 };
-
+class LittleFiles : public btc::FileStore {
+public:
+  bool read(const std::string &path, std::string &data) override {
+    File f = LittleFS.open(path.c_str(), "r");
+    if (!f || f.size() > 65536)
+      return false;
+    const size_t length = f.size();
+    data.resize(length);
+    const size_t got = length ? f.readBytes(&data[0], length) : 0;
+    f.close();
+    return got == length;
+  }
+  bool write(const std::string &path, const std::string &data) override {
+    File f = LittleFS.open(path.c_str(), "w");
+    if (!f)
+      return false;
+    const size_t written = f.write(reinterpret_cast<const uint8_t *>(data.data()), data.size());
+    f.flush();
+    f.close();
+    return written == data.size(); // Journal also reopens and validates the full record.
+  }
+};
+static LittleFiles files;
+static btc::Journal runJournal(files, "/run-a.dat", "/run-b.dat");
+static btc::Journal foundJournal(files, "/found-a.dat", "/found-b.dat");
+static btc::FoundRecords foundRecords(foundJournal);
+static btc::Crypto crypto;
+static btc::RunStats runStats;
 static Puzzle puzzle;
 static bool searching = false;
-static uint64_t tries = 0;
-static uint64_t runStartTries = 0;
-static uint64_t accumulatedRunMs = 0;
-static uint64_t activeRunStartMs = 0;
-static uint16_t savedPuzzleId = 0;
+static bool randomEveryKey = false; // Default: fresh random start every 60 seconds.
+static bool ready = false;
+static bool fsReady = false;
+static bool foundReady = false;
+static bool runCheckpointDirty = false;
+static bool walkReady = false;
+static bool stepValidated = false;
+static uint8_t currentKey[32] = {};
+static uint32_t chunkStartedMs = 0;
 static uint32_t lastPersistMs = 0;
-static uint64_t lastPersistTries = 0;
-static bool littleFsReady = false;
-static uint64_t lastStatsTries = 0;
-static uint32_t lastStatsMs = 0;
-static String pendingFoundMessage;
-#if !SERIAL_ONLY
-static uint32_t lastTelegramPollMs = 0;
-static int64_t telegramOffset = 0;
-static bool credentialsPresent = false;
-static uint32_t lastWifiReconnectMs = 0;
+static uint32_t lastLogMs = 0;
+static uint64_t lastLogTries = 0;
 static uint32_t lastFoundRetryMs = 0;
-#endif
-static bool appReady = false;
-static bool cryptoReady = false;
-static mbedtls_ecp_group secpGroup;
-static mbedtls_ecp_point publicPoint;
-static mbedtls_mpi privateScalar;
-
-static constexpr const char *STATE_PATH = "/state.json";
-static constexpr uint32_t STATE_PERSIST_MS = 10000;
-
-static void saveState(bool force = false) {
-  const uint32_t now = millis();
-  if (!force && now - lastPersistMs < STATE_PERSIST_MS && tries - lastPersistTries < 1000) return;
-  if (!littleFsReady) return;
-  File file = LittleFS.open("/state.tmp", "w");
-  if (!file) return;
-  JsonDocument doc;
-  doc["puzzle_id"] = puzzle.loaded ? puzzle.id : savedPuzzleId;
-  doc["tries"] = (unsigned long long)tries;
-  doc["run_ms"] = (unsigned long long)(accumulatedRunMs + (searching ? now - activeRunStartMs : 0));
-  doc["run_tries"] = (unsigned long long)runStartTries;
-  doc["searching"] = searching;
-  serializeJson(doc, file);
-  file.flush();
-  file.close();
-  LittleFS.remove(STATE_PATH);
-  LittleFS.rename("/state.tmp", STATE_PATH);
-  lastPersistMs = now;
-  lastPersistTries = tries;
-}
-
-static void loadState() {
-  // Format the data partition on its first boot (or if its filesystem is damaged).
-  // The partition table already allocates the SPIFFS-labeled region for LittleFS.
-  littleFsReady = LittleFS.begin(true);
-  if (!littleFsReady) {
-    logLine("LittleFS mount failed; persistent run stats unavailable.");
-    return;
-  }
-  if (!LittleFS.exists(STATE_PATH)) return;
-  File file = LittleFS.open(STATE_PATH, "r");
-  if (!file) return;
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, file);
-  file.close();
-  if (error) {
-    logLine("Saved state is invalid; starting with fresh stats.");
-    return;
-  }
-  savedPuzzleId = doc["puzzle_id"] | 0;
-  tries = doc["tries"] | 0ULL;
-  accumulatedRunMs = doc["run_ms"] | 0ULL;
-  runStartTries = doc["run_tries"] | tries;
-  searching = (doc["searching"] | false) && savedPuzzleId > 0 && savedPuzzleId <= MAX_PUZZLE_ID;
-  activeRunStartMs = 0;
-  if (searching) activeRunStartMs = millis();
-  logLine("Restored LittleFS state: puzzle " + String(savedPuzzleId) + ", " +
-    String((unsigned long long)tries) + " attempts, " +
-    String((unsigned long long)(accumulatedRunMs / 1000)) + " seconds total, " +
-    String(searching ? "search will resume." : "search stopped."));
-}
-
+struct SelfTestJob {
+  bool active = false;
+  bool all = false;
+  bool walk = true;
+  bool pointReady = false;
+  uint8_t key[32] = {};
+  uint16_t chunkCandidates = 0;
+  uint32_t chunkStartedMs = 0;
+  uint32_t chunks = 0;
+  uint64_t walkSteps = 0;
+  uint32_t pointChecks = 0;
+  uint16_t id = 0;
+  uint8_t target[20] = {};
+  btc::RunStats stats;
+  String summary;
+};
+static SelfTestJob selftest;
+static String lastSelftestReport;
 #if !SERIAL_ONLY
-static bool sendTelegram(const String &text);
+static int64_t telegramOffset = 0;
+static uint32_t lastTelegramMs = 0;
+static uint32_t lastWifiMs = 0;
+static bool credentialsPresent = false;
+static String pendingResumeMessage;
 #endif
 
-static void logLine(const String &s) {
-  Serial.println(s);
-}
-
-static void reply(const String &s) {
-  Serial.println(s);
-#if !SERIAL_ONLY
-  sendTelegram(s);
-#endif
-}
-
-#if !SERIAL_ONLY
-static void configureTls(WiFiClientSecure &client) {
-  // Temporary diagnostic: distinguish TLS certificate validation from TCP/network failure.
-  client.setInsecure();
-  client.setHandshakeTimeout(15);
-}
-
-#endif
-
-static bool fetchPuzzle(uint16_t id, Puzzle &result) {
-  if (id < 1 || id > MAX_PUZZLE_ID) return false;
-  result.id = id;
-  result.address = PUZZLE_ADDRESSES[id - 1];
-  result.loaded = true;
-
-  // Puzzle n uses the inclusive key range [2^(n-1), 2^n - 1].
-  mbedtls_mpi start, end;
-  mbedtls_mpi_init(&start);
-  mbedtls_mpi_init(&end);
-  bool rangeOk = mbedtls_mpi_lset(&start, 1) == 0 &&
-                 mbedtls_mpi_shift_l(&start, id - 1) == 0 &&
-                 mbedtls_mpi_lset(&end, 1) == 0 &&
-                 mbedtls_mpi_shift_l(&end, id) == 0 &&
-                 mbedtls_mpi_sub_int(&end, &end, 1) == 0;
-  char startBuf[65] = {0}, endBuf[65] = {0};
-  size_t startLen = 0, endLen = 0;
-  rangeOk = rangeOk &&
-    mbedtls_mpi_write_string(&start, 16, startBuf, sizeof(startBuf), &startLen) == 0 &&
-    mbedtls_mpi_write_string(&end, 16, endBuf, sizeof(endBuf), &endLen) == 0;
-  mbedtls_mpi_free(&start);
-  mbedtls_mpi_free(&end);
-  if (!rangeOk) return false;
-  result.startHex = startBuf;
-  result.endHex = endBuf;
-  return true;
-}
-
-static int rngCallback(void *, unsigned char *output, size_t length) {
-  esp_fill_random(output, length);
+static String str(const std::string &s) { return String(s.c_str()); }
+static void logLine(const String &s) { Serial.println(s); }
+static int hardwareRng(void *, unsigned char *out, size_t length) {
+  esp_fill_random(out, length);
   return 0;
 }
-
-static String bytesToHex(const uint8_t *data, size_t length) {
-  static const char hex[] = "0123456789abcdef";
-  String out;
-  out.reserve(length * 2);
-  for (size_t i = 0; i < length; ++i) {
-    out += hex[data[i] >> 4];
-    out += hex[data[i] & 0x0f];
-  }
-  return out;
-}
-
-static bool makeRandomPuzzleKey(uint16_t bits, uint8_t key[32]) {
-  if (bits == 0 || bits > 160) return false;
-  esp_fill_random(key, 32);
-  const uint16_t bytes = (bits + 7) / 8;
-  const uint16_t first = 32 - bytes;
-  for (uint16_t i = 0; i < first; ++i) key[i] = 0;
-  const uint8_t highBits = bits % 8;
-  if (highBits) {
-    const uint8_t mask = (1U << highBits) - 1;
-    key[first] &= mask;
-    key[first] |= 1U << (highBits - 1);
-  } else {
-    key[first] |= 0x80;
-  }
-  return true;
-}
-
-static String base58Encode(const uint8_t *input, size_t length) {
-  static const char alphabet[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-  size_t zeros = 0;
-  while (zeros < length && input[zeros] == 0) ++zeros;
-  uint8_t work[80];
-  if (length > sizeof(work)) return "";
-  memcpy(work, input, length);
-  char encoded[120];
-  size_t out = sizeof(encoded);
-  size_t start = zeros;
-  while (start < length) {
-    unsigned remainder = 0;
-    for (size_t i = start; i < length; ++i) {
-      unsigned value = (remainder << 8) | work[i];
-      work[i] = value / 58;
-      remainder = value % 58;
-    }
-    encoded[--out] = alphabet[remainder];
-    while (start < length && work[start] == 0) ++start;
-  }
-  while (out < sizeof(encoded) && encoded[out] == alphabet[0]) ++out;
-  while (zeros--) encoded[--out] = alphabet[0];
-  return String(encoded + out, sizeof(encoded) - out);
-}
-
-static String base58Check(const uint8_t *payload, size_t payloadLength) {
-  uint8_t buffer[80];
-  if (payloadLength + 4 > sizeof(buffer)) return "";
-  memcpy(buffer, payload, payloadLength);
-  uint8_t firstHash[32], secondHash[32];
-  if (mbedtls_sha256(payload, payloadLength, firstHash, 0) != 0 ||
-      mbedtls_sha256(firstHash, sizeof(firstHash), secondHash, 0) != 0) return "";
-  memcpy(buffer + payloadLength, secondHash, 4);
-  return base58Encode(buffer, payloadLength + 4);
-}
-
-static String addressForPublicKey(const uint8_t *pubkey, size_t pubkeyLength) {
-  uint8_t sha[32], ripe[20], payload[21];
-  if (mbedtls_sha256(pubkey, pubkeyLength, sha, 0) != 0) return "";
-  CRIPEMD160 ripemd;
-  ripemd.Write(sha, sizeof(sha));
-  ripemd.Finalize(ripe);
-  payload[0] = 0x00;  // Bitcoin mainnet P2PKH version byte.
-  memcpy(payload + 1, ripe, sizeof(ripe));
-  return base58Check(payload, sizeof(payload));
-}
-
-static String wifForPrivateKey(const uint8_t key[32], bool compressed) {
-  uint8_t payload[34];
-  payload[0] = 0x80;
-  memcpy(payload + 1, key, 32);
-  size_t length = 33;
-  if (compressed) payload[length++] = 0x01;
-  return base58Check(payload, length);
-}
-
-static bool testCandidate(const uint8_t key[32], String &matchedAddress,
-                          bool &compressedMatch) {
-  if (mbedtls_mpi_read_binary(&privateScalar, key, 32) != 0) return false;
-  if (mbedtls_ecp_mul(&secpGroup, &publicPoint, &privateScalar,
-                      &secpGroup.G, rngCallback, nullptr) != 0) return false;
-
-  uint8_t encoded[65];
-  size_t encodedLength = 0;
-  if (mbedtls_ecp_point_write_binary(&secpGroup, &publicPoint,
-          MBEDTLS_ECP_PF_COMPRESSED, &encodedLength, encoded, sizeof(encoded)) != 0) return false;
-  String compressedAddress = addressForPublicKey(encoded, encodedLength);
-  if (compressedAddress == puzzle.address) {
-    matchedAddress = compressedAddress;
-    compressedMatch = true;
-    return true;
-  }
-
-  if (mbedtls_ecp_point_write_binary(&secpGroup, &publicPoint,
-          MBEDTLS_ECP_PF_UNCOMPRESSED, &encodedLength, encoded, sizeof(encoded)) != 0) return false;
-  String uncompressedAddress = addressForPublicKey(encoded, encodedLength);
-  if (uncompressedAddress == puzzle.address) {
-    matchedAddress = uncompressedAddress;
-    compressedMatch = false;
-    return true;
-  }
-  return false;
-}
-
-static void blinkKeyChecked() {
+static void keyLed(bool on) {
 #if defined(RGB_BUILTIN)
-  rgbLedWrite(RGB_BUILTIN, 0, 24, 0);
-  delay(KEY_CHECK_BLINK_MS);
-  rgbLedWrite(RGB_BUILTIN, 0, 0, 0);
+  rgbLedWrite(RGB_BUILTIN, 0, on ? 24 : 0, 0);
 #elif defined(LED_BUILTIN)
-  // The Nologo C3 Super Mini's single-color onboard LED is active-low.
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
-  delay(KEY_CHECK_BLINK_MS);
-  digitalWrite(LED_BUILTIN, HIGH);
+  digitalWrite(LED_BUILTIN, on ? LOW : HIGH);
 #endif
 }
-
 #if !SERIAL_ONLY
-static String telegramUrl(const char *method) {
-  return String("https://api.telegram.org/bot") + TELEGRAM_BOT_TOKEN + "/" + method;
-}
-
 static bool sendTelegram(const String &text) {
-  if (WiFi.status() != WL_CONNECTED || String(TELEGRAM_BOT_TOKEN).length() < 20) return false;
+  if (!credentialsPresent || WiFi.status() != WL_CONNECTED)
+    return false;
+  // Certificate validity checks need a plausible UTC clock; never fall back to insecure TLS.
+  if (time(nullptr) < 1700000000)
+    return false;
   WiFiClientSecure client;
-  configureTls(client);
+  client.useBuiltinCACertBundle();
+  client.setHandshakeTimeout(15);
   HTTPClient http;
   http.setTimeout(15000);
-  if (!http.begin(client, telegramUrl("sendMessage"))) return false;
+  if (!http.begin(client,
+                  String("https://api.telegram.org/bot") + TELEGRAM_BOT_TOKEN + "/sendMessage"))
+    return false;
   http.addHeader("Content-Type", "application/json");
-  JsonDocument body;
-  body["chat_id"] = TELEGRAM_OWNER_CHAT_ID;
-  body["text"] = text;
-  String payload;
-  serializeJson(body, payload);
-  const int code = http.POST(payload);
-  if (code < 200 || code >= 300) logLine("Telegram send failed: HTTP " + String(code));
+  JsonDocument doc;
+  doc["chat_id"] = TELEGRAM_OWNER_CHAT_ID;
+  doc["text"] = text;
+  String body;
+  serializeJson(doc, body);
+  const int code = http.POST(body);
+  JsonDocument response;
+  const bool ok =
+      code == 200 && !deserializeJson(response, http.getString()) && (response["ok"] | false);
+  if (!ok)
+    logLine("Telegram send failed: HTTP " + String(code));
   http.end();
-  return code >= 200 && code < 300;
+  return ok;
 }
 #endif
-
-static String formatStats() {
-  uint64_t elapsedMs = accumulatedRunMs + (searching ? millis() - activeRunStartMs : 0);
-  uint64_t runAttempts = tries - runStartTries;
-  double rate = elapsedMs ? (double)runAttempts * 1000.0 / elapsedMs : 0.0;
-  String msg = "Puzzle: " + String(puzzle.id) + "\n";
-  msg += "Target: " + puzzle.address + "\n";
-  msg += "Public status: https://btcpuzzle.info/puzzle\n";
-  msg += "State: " + String(searching ? "searching" : "stopped") + "\n";
-  msg += "Random candidates checked: " + String((unsigned long long)tries) + "\n";
-  msg += "Rate: " + String(rate, 2) + " keys/s\n";
-  msg += "Run time: " + String((unsigned long)(elapsedMs / 1000)) + " s\n";
-  msg += "Search method: random sampling in [2^" + String(puzzle.id - 1) +
-         ", 2^" + String(puzzle.id) + "-1]";
-  return msg;
+static void reply(const String &text) {
+  logLine(text);
+#if !SERIAL_ONLY
+  // Found histories can exceed Telegram's per-message size limit.
+  unsigned start = 0;
+  while (start < text.length()) {
+    unsigned end = start + 3500;
+    if (end > text.length())
+      end = text.length();
+    sendTelegram(text.substring(start, end));
+    start = end;
+  }
+#endif
 }
-
+static bool loadPuzzle(uint16_t id, Puzzle &p) {
+  if (id < 1 || id > MAX_PUZZLE_ID)
+    return false;
+  p.id = id;
+  p.address = PUZZLE_ADDRESSES[id - 1];
+  p.loaded = btc::decodeAddress(p.address.c_str(), p.target);
+  return p.loaded;
+}
+static String foundText(const btc::FoundRecord &r) {
+  String out = "Stored result — puzzle " + String(r.puzzle);
+  out += "\nAddress: " + String(PUZZLE_ADDRESSES[r.puzzle - 1]);
+  out += "\nPrivate key (hex): " + str(btc::hex(r.key.data(), r.key.size()));
+  out += "\nPrivate key (WIF): " + str(btc::wif(r.key.data(), r.compressed));
+  out += "\nChecked: " + String((unsigned long long)r.attempts) + " candidates";
+  out += "\nRun time: " + String((unsigned long long)(r.elapsedMs / 1000)) + " s";
+  out += "\nTelegram delivery: " + String(r.pending ? "pending" : "not pending");
+  return out;
+}
+static bool saveState(bool force = false) {
+  const uint32_t now = millis();
+  runStats.tick(now);
+  if (force)
+    runCheckpointDirty = true;
+  if (!force && ((!searching || selftest.active) && !runCheckpointDirty))
+    return true;
+  if (!force && uint32_t(now - lastPersistMs) < CHECKPOINT_MS)
+    return true;
+  lastPersistMs = now;
+  if (!fsReady)
+    return false;
+  JsonDocument doc;
+  doc["schema"] = 2;
+  doc["puzzle_id"] = puzzle.loaded ? puzzle.id : 0;
+  doc["tries"] = (unsigned long long)runStats.attempts;
+  doc["run_ms"] = (unsigned long long)runStats.elapsedMs;
+  doc["searching"] = searching;
+  doc["mode"] = randomEveryKey ? "random" : "chunk";
+  std::string payload;
+  runCheckpointDirty = true;
+  if (!serializeJson(doc, payload) || !runJournal.save(payload)) {
+    logLine("Checkpoint failed; previous valid checkpoint retained.");
+    return false;
+  }
+  runCheckpointDirty = false;
+  return true;
+}
+static bool restorePayload(const std::string &payload) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload) || !doc["puzzle_id"].is<unsigned>() ||
+      !doc["tries"].is<uint64_t>() || !doc["run_ms"].is<uint64_t>())
+    return false;
+  const unsigned id = doc["puzzle_id"];
+  if (id > MAX_PUZZLE_ID)
+    return false;
+  if (id && !loadPuzzle(id, puzzle))
+    return false;
+  runStats.attempts = doc["tries"].as<uint64_t>();
+  runStats.elapsedMs = doc["run_ms"].as<uint64_t>();
+  searching = id && (doc["searching"] | false);
+  randomEveryKey = strcmp(doc["mode"] | "chunk", "random") == 0;
+  return true;
+}
+static bool mountStorage() {
+  if (LittleFS.begin(false))
+    return true;
+#if defined(ARDUINO)
+  // First boot may need formatting. Never auto-format a nonblank partition:
+  // a mount error must not erase the only copies of previously found keys.
+  const esp_partition_t *part = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "spiffs");
+  if (!part)
+    return false;
+  uint8_t block[512];
+  for (size_t offset = 0; offset < part->size; offset += sizeof(block)) {
+    const size_t length = part->size - offset < sizeof(block) ? part->size - offset : sizeof(block);
+    if (esp_partition_read(part, offset, block, length) != ESP_OK)
+      return false;
+    for (size_t i = 0; i < length; ++i)
+      if (block[i] != 0xff)
+        return false;
+    if ((offset % 32768) == 0)
+      yield();
+  }
+  return LittleFS.begin(true); // Confirmed erased factory partition only.
+#else
+  return false;
+#endif
+}
+static void loadState() {
+  fsReady = mountStorage();
+  if (!fsReady) {
+    logLine("LittleFS mount failed; searches are disabled until storage is available.");
+    return;
+  }
+  foundReady = foundRecords.load();
+  if (!foundReady)
+    logLine("Found-record journal is damaged; do not erase flash. Recovery required.");
+  std::string payload;
+  if (runJournal.load(payload)) {
+    if (!restorePayload(payload))
+      logLine("Invalid run payload; run remains stopped.");
+  } else if (!runJournal.hasFiles()) {
+    // Migrate old firmware checkpoints; recover the old temporary file if necessary.
+    bool restored = files.read("/state.json", payload) && restorePayload(payload);
+    if (!restored)
+      restored = files.read("/state.tmp", payload) && restorePayload(payload);
+    if (restored) {
+      logLine("Migrated legacy run checkpoint.");
+      saveState(true);
+    }
+  } else
+    logLine("No valid run checkpoint; run remains stopped.");
+  runStats.lastTick = millis();
+  runStats.running = searching;
+  // If power failed after saving a result but before saving the stopped flag, prefer the result.
+  if (puzzle.loaded && foundRecords.get(puzzle.id)) {
+    searching = false;
+    runStats.stop(millis());
+  }
+}
+static String formatStats() {
+  runStats.tick(millis());
+  String out;
+  if (selftest.active)
+    out += "SELFTEST active: puzzle " + String(selftest.id) +
+           "\nAttempts: " + String((unsigned long long)selftest.stats.attempts) + "\nTest mode: " +
+           String(selftest.walk ? "walk: 50 keys / 2 s per chunk" : "independent random") +
+           "\nWalk steps: " + String((unsigned long long)selftest.walkSteps) +
+           "\nReference checks: " + String(selftest.pointChecks) + "\n\n";
+  if (puzzle.loaded) {
+    out += "Puzzle: " + String(puzzle.id) + "\nTarget: " + puzzle.address;
+    out += "\nState: " + String(selftest.active ? "paused for selftest"
+                                : searching     ? "searching"
+                                                : "stopped");
+    out += "\nCandidates checked: " + String((unsigned long long)runStats.attempts);
+    out += "\nAverage rate: " + String(runStats.rate(), 2) + " keys/s";
+    out += "\nRun time: " + String((unsigned long long)(runStats.elapsedMs / 1000)) + " s";
+    out += "\nSearch method: " + String(randomEveryKey
+                                            ? "independent random key every attempt"
+                                            : "sequential chunks, fresh random start every 60 s");
+    if (const auto *r = foundRecords.get(puzzle.id))
+      out += "\n\n" + foundText(*r);
+  } else
+    out += "No puzzle selected. Use /puzzle <ID>.";
+  out += "\nPublic status: https://btcpuzzle.info/puzzle";
+  out += "\nStored puzzle IDs:";
+  if (foundRecords.all().empty())
+    out += " none";
+  for (const auto &r : foundRecords.all())
+    out += " " + String(r.puzzle);
+  if (!fsReady)
+    out += "\nWARNING: LittleFS unavailable; existing flash was not reformatted.";
+  else if (!foundReady)
+    out += "\nWARNING: found-key journal is damaged; preserve flash for recovery.";
+  if (foundRecords.dirty())
+    out += "\nWARNING: found record is in RAM; flash save will be retried.";
+  if (!selftest.active && !lastSelftestReport.isEmpty())
+    out += "\n\n" + lastSelftestReport;
+  return out;
+}
+static void resetSpeedWindow() {
+  lastLogMs = millis();
+  lastLogTries = runStats.attempts;
+}
+static void endSelftest(const String &message, bool resume = true) {
+  selftest.stats.stop(millis());
+  selftest.active = false;
+  lastSelftestReport = selftest.summary + message;
+  walkReady = false;
+  if (resume && searching)
+    runStats.start(millis());
+  resetSpeedWindow();
+  reply(lastSelftestReport + ((resume && searching) ? "\nNormal search resumed." : ""));
+}
+static bool validatePoint(const uint8_t key[32]) {
+  btc::Crypto reference;
+  if (!reference.begin(hardwareRng) || !reference.derive(key))
+    return false;
+  uint8_t a[65], b[65];
+  size_t na = 0, nb = 0;
+  return crypto.serialize(false, a, na) && reference.serialize(false, b, nb) && na == nb &&
+         !memcmp(a, b, na);
+}
+static void failSelftest(const String &reason) {
+  searching = false;
+  endSelftest("SELFTEST FAILED: " + reason, false);
+  saveState(true);
+}
+static bool verifySelftestPoint() {
+  if (!validatePoint(selftest.key)) {
+    failSelftest("walk point disagrees with fresh scalar multiplication.");
+    return false;
+  }
+  ++selftest.pointChecks;
+  return true;
+}
+static bool startTestPuzzle(uint16_t id) {
+  if (id < 1 || id > 10)
+    return false;
+  selftest.id = id;
+  selftest.pointReady = false;
+  selftest.chunkCandidates = 0;
+  selftest.chunks = 0;
+  selftest.walkSteps = 0;
+  selftest.pointChecks = 0;
+  selftest.stats.reset(millis());
+  selftest.stats.start(millis());
+  return btc::decodeAddress(PUZZLE_ADDRESSES[id - 1], selftest.target);
+}
+static void selftestOneCandidate() {
+  uint8_t key[32];
+  bool compressed = true;
+  // Check the time bound between operations (including after blocked Telegram I/O).
+  if (selftest.walk && selftest.pointReady &&
+      uint32_t(millis() - selftest.chunkStartedMs) >= SELFTEST_CHUNK_MS) {
+    if (!verifySelftestPoint())
+      return;
+    selftest.pointReady = false;
+  }
+  keyLed(true);
+  btc::Check result = btc::Check::Error;
+  if (selftest.walk) {
+    if (!selftest.pointReady) {
+      selftest.chunkStartedMs = millis();
+      selftest.chunkCandidates = 0;
+      selftest.pointReady =
+          btc::randomKey(selftest.id, selftest.key, hardwareRng) && crypto.derive(selftest.key);
+      if (selftest.pointReady)
+        ++selftest.chunks;
+    }
+    if (selftest.pointReady) {
+      memcpy(key, selftest.key, 32);
+      result = crypto.checkCurrent(selftest.target, compressed);
+    }
+  } else if (btc::randomKey(selftest.id, key, hardwareRng)) {
+    result = crypto.check(key, selftest.target, compressed);
+  }
+  keyLed(false);
+  selftest.stats.tick(millis());
+  if (result == btc::Check::Error) {
+    failSelftest("cryptographic operation failed.");
+    return;
+  }
+  ++selftest.stats.attempts;
+  if (selftest.walk)
+    ++selftest.chunkCandidates;
+  if (result != btc::Check::Match) {
+    if (selftest.walk) {
+      const bool boundary = selftest.chunkCandidates >= SELFTEST_CHUNK_KEYS ||
+                            uint32_t(millis() - selftest.chunkStartedMs) >= SELFTEST_CHUNK_MS ||
+                            btc::maximumKey(selftest.id, selftest.key);
+      if (boundary) {
+        if (!verifySelftestPoint())
+          return;
+        selftest.pointReady = false;
+      } else {
+        if (!crypto.increment()) {
+          failSelftest("incremental arithmetic failed.");
+          return;
+        }
+        for (int i = 31; i >= 0; --i)
+          if (++selftest.key[i])
+            break;
+        ++selftest.walkSteps;
+        // Check the first increment and the end of each chunk, plus every target match.
+        if (selftest.chunkCandidates == 1 && !verifySelftestPoint())
+          return;
+      }
+    }
+    selftest.stats.tick(millis());
+    return;
+  }
+  if (selftest.walk && !verifySelftestPoint())
+    return;
+  selftest.stats.tick(millis());
+  uint8_t expected[32] = {};
+  uint64_t known = SELFTEST_KEYS[selftest.id - 1];
+  for (int i = 31; known; --i, known >>= 8)
+    expected[i] = known;
+  if (memcmp(expected, key, 32) != 0 || !compressed) {
+    failSelftest("unexpected discovered key/encoding.");
+    return;
+  }
+  // A self-test genuinely discovers the key through the same randomized search.
+  // Keep that result independently, without replacing an earlier discovery record.
+  if (!foundRecords.get(selftest.id)) {
+    btc::FoundRecord record;
+    record.puzzle = selftest.id;
+    memcpy(record.key.data(), key, 32);
+    record.compressed = compressed;
+    record.pending = !SERIAL_ONLY;
+    record.attempts = selftest.stats.attempts;
+    record.elapsedMs = selftest.stats.elapsedMs;
+    if (!foundReady || !foundRecords.put(record)) {
+      searching = false;
+      endSelftest("SELFTEST found key " + str(btc::hex(key, 32)) +
+                      "; flash save failed. Result retained in RAM; keep power connected.",
+                  false);
+      saveState(true);
+      return;
+    }
+  }
+  const String resultText =
+      "SELFTEST PASS puzzle " + String(selftest.id) + ": discovered " + str(btc::hex(key, 32)) +
+      " after " + String((unsigned long long)selftest.stats.attempts) +
+      (selftest.walk ? " walk attempts (" : " independent random attempts (") +
+      String(selftest.stats.rate(), 2) + " keys/s)." +
+      (selftest.walk ? " Walk steps: " + String((unsigned long long)selftest.walkSteps) +
+                           "; reference checks: " + String(selftest.pointChecks) +
+                           "; chunks: " + String(selftest.chunks) + "."
+                     : "");
+  selftest.summary += resultText + "\n";
+  if (selftest.all && selftest.id < 10) {
+    reply(resultText);
+    if (!startTestPuzzle(selftest.id + 1))
+      endSelftest("SELFTEST FAILED: invalid target.");
+  } else
+    endSelftest("SELFTEST completed.");
+}
+static unsigned parseId(const String &value, unsigned maximum = MAX_PUZZLE_ID) {
+  if (value.isEmpty())
+    return 0;
+  unsigned id = 0;
+  for (unsigned i = 0; i < value.length(); ++i) {
+    if (value[i] < '0' || value[i] > '9')
+      return 0;
+    id = id * 10 + unsigned(value[i] - '0');
+    if (id > maximum)
+      return 0;
+  }
+  return id;
+}
 static void handleCommand(const String &text) {
   String command = text;
   command.trim();
+  if (!command.startsWith("/"))
+    command = "/" + command;
   const int space = command.indexOf(' ');
   String verb = space < 0 ? command : command.substring(0, space);
   String arg = space < 0 ? "" : command.substring(space + 1);
-  const int at = verb.indexOf('@');
-  if (at >= 0) verb = verb.substring(0, at);
+  arg.trim();
+  int at = verb.indexOf('@');
+  if (at >= 0)
+    verb = verb.substring(0, at);
   verb.toLowerCase();
-
   if (verb == "/help" || verb == "/start") {
-#if SERIAL_ONLY
-    reply("ESP32 standalone BTC puzzle client\n"
-      "/puzzle <ID> - load embedded public puzzle target (1-160)\n"
-      "/run - start randomized local search\n"
-      "/stop - stop search\n"
-      "/status - show tries and local keys/s\n"
-      "Serial-only build; Telegram is disabled.");
-#else
-    reply("ESP32 standalone BTC puzzle client\n"
-      "/puzzle <ID> - load embedded public puzzle target (1-160)\n"
-      "/run - start randomized local search\n"
-      "/stop - stop search\n"
-      "/status - show tries and local keys/s\n"
-      "Serial and Telegram commands are supported. No pool work is requested or submitted.");
-#endif
-  } else if (verb == "/puzzle") {
-    int id = arg.toInt();
-    if (searching) {
-      reply("Stop the search before changing puzzle.");
-    } else if (id < 1 || id > MAX_PUZZLE_ID) {
-      reply("Puzzle ID must be 1 through 160.");
-    } else {
-      Puzzle next;
-      reply("Loading embedded target for puzzle " + String(id) + "...");
-      if (fetchPuzzle(id, next)) {
-        puzzle = next;
-        savedPuzzleId = puzzle.id;
-        tries = 0;
-        runStartTries = 0;
-        accumulatedRunMs = 0;
-        activeRunStartMs = 0;
-        saveState(true);
-        reply("Loaded puzzle " + String(puzzle.id) + "\nTarget: " + puzzle.address +
-          "\nRange: " + puzzle.startHex + " .. " + puzzle.endHex +
-          "\nPublic puzzle status: https://btcpuzzle.info/puzzle" +
-          "\nUse /run to start random search.");
-      } else {
-        reply("Could not prepare embedded data for puzzle " + String(id) + ".");
+    reply("ESP32 BTC puzzle client\n"
+          "/puzzle <1-160> - select embedded target; show any stored result\n"
+          "/run, /stop, /status\n"
+          "/mode chunk|random - 60-second random restarts or independent random keys\n"
+          "/found [ID] - list saved keys\n"
+          "/clear-found [ID|all] - delete saved keys (default all)\n"
+          "/selftest [1-10|all] [walk|random] - default: all, walk; 50 keys / 2 s per chunk\n"
+          "Selftests pause/resume the normal run. No pool is used.");
+  } else if (verb == "/status")
+    reply(formatStats());
+  else if (verb == "/found") {
+    const unsigned id = parseId(arg);
+    if (!arg.isEmpty() && !id) {
+      reply("Use /found [1-160].");
+      return;
+    }
+    bool any = false;
+    for (const auto &r : foundRecords.all())
+      if (!id || id == r.puzzle) {
+        reply(foundText(r));
+        any = true;
       }
+    if (!any)
+      reply("No stored result for that selection.");
+  } else if (verb == "/clear-found") {
+    const unsigned id = parseId(arg);
+    if (!arg.isEmpty() && arg != "all" && !id) {
+      reply("Use /clear-found [1-160|all].");
+      return;
     }
-  } else if (verb == "/run") {
-    if (!puzzle.loaded) {
-      reply("Choose a puzzle first with /puzzle <ID>.");
-    } else if (!searching) {
-      searching = true;
-      activeRunStartMs = millis();
-      runStartTries = tries;
-      saveState(true);
-      lastStatsTries = tries;
-      lastStatsMs = millis();
-      reply("Random search started for puzzle " + String(puzzle.id) +
-        ". Candidates stay inside its published key range.");
-    } else {
-      reply("Search is already running.\n\n" + formatStats());
+    if (!foundReady && id) {
+      reply("Found journal is damaged. Use /clear-found all only if you want to discard it.");
+      return;
     }
-  } else if (verb == "/stop") {
-    searching = false;
-    if (activeRunStartMs) accumulatedRunMs += millis() - activeRunStartMs;
-    activeRunStartMs = 0;
+    if (!fsReady || !foundRecords.clear(id))
+      reply("Could not save deletion. Found records retained.");
+    else {
+      foundReady = true;
+      reply(id ? "Cleared stored result for puzzle " + String(id) + "."
+               : "Cleared all stored results.");
+    }
+  } else if (verb == "/puzzle") {
+    const unsigned id = parseId(arg);
+    if (searching || selftest.active) {
+      reply("Use /stop before changing puzzle.");
+      return;
+    }
+    if (!id || !loadPuzzle(id, puzzle)) {
+      reply("Puzzle ID must be 1 through 160.");
+      return;
+    }
+    walkReady = false;
+    runStats.reset(millis());
     saveState(true);
-    reply("Search stopped.\n\n" + formatStats());
-  } else if (verb == "/status") {
-    reply(puzzle.loaded ? formatStats() :
-      "No puzzle selected. Use /puzzle <ID>. Public puzzle list: https://btcpuzzle.info/puzzle");
-  } else {
-    reply("Unknown command. Send /help.");
-  }
+    reply("Selected puzzle " + String(id) + "\nTarget: " + puzzle.address + "\nRange: [2^" +
+          String(id - 1) + ", 2^" + String(id) +
+          "-1]\nPublic status: https://btcpuzzle.info/puzzle");
+    if (const auto *r = foundRecords.get(id))
+      reply(foundText(*r));
+  } else if (verb == "/mode") {
+    if (searching || selftest.active) {
+      reply("Use /stop before changing mode.");
+      return;
+    }
+    if (arg != "chunk" && arg != "random") {
+      reply("Use /mode chunk or /mode random.");
+      return;
+    }
+    randomEveryKey = arg == "random";
+    walkReady = false;
+    saveState(true);
+    reply(randomEveryKey ? "Mode: independent random key every attempt."
+                         : "Mode: new random start every 60 seconds; increment within each chunk.");
+  } else if (verb == "/run") {
+    if (selftest.active) {
+      reply("Selftest is running. Use /stop to cancel.");
+      return;
+    }
+    if (!puzzle.loaded) {
+      reply("Use /puzzle <ID> first.");
+      return;
+    }
+    if (!fsReady || !foundReady || foundRecords.dirty()) {
+      reply("Found-key storage is unavailable or awaiting a retry. Resolve storage before "
+            "searching.");
+      return;
+    }
+    if (const auto *r = foundRecords.get(puzzle.id)) {
+      reply(foundText(*r));
+      return;
+    }
+    if (!searching) {
+      searching = true;
+      runStats.start(millis());
+      walkReady = false;
+      resetSpeedWindow();
+      saveState(true);
+    }
+    reply("Search running.\n" + formatStats());
+  } else if (verb == "/stop") {
+    if (selftest.active)
+      endSelftest("SELFTEST cancelled.", false);
+    runStats.stop(millis());
+    searching = false;
+    saveState(true);
+    reply("Search stopped.\n" + formatStats());
+  } else if (verb == "/selftest") {
+    if (!fsReady || !foundReady || foundRecords.dirty()) {
+      reply("Resolve found-key storage before starting a selftest.");
+      return;
+    }
+    if (selftest.active) {
+      reply("A selftest is already running. Use /stop to cancel.");
+      return;
+    }
+    String selection = arg;
+    String testMode = "walk";
+    const int split = selection.indexOf(' ');
+    if (split >= 0) {
+      testMode = selection.substring(split + 1);
+      selection = selection.substring(0, split);
+      testMode.trim();
+    } else if (selection == "walk" || selection == "random") {
+      testMode = selection;
+      selection = "all";
+    }
+    const unsigned id = parseId(selection, 10);
+    if ((!selection.isEmpty() && selection != "all" && !id) ||
+        (testMode != "walk" && testMode != "random")) {
+      reply("Use /selftest [1-10|all] [walk|random].");
+      return;
+    }
+    runStats.stop(millis());
+    saveState(true); // Preserve the normal resume flag; the diagnostic job itself is not persisted.
+    selftest.active = true;
+    selftest.all = !id;
+    selftest.walk = testMode == "walk";
+    selftest.summary = "";
+    if (!startTestPuzzle(id ? id : 1)) {
+      endSelftest("SELFTEST FAILED: invalid target.");
+      return;
+    }
+    reply("SELFTEST started: " + String(selftest.all ? "puzzles 1-10" : "puzzle " + String(id)) +
+          (selftest.walk ? ". Walk: random chunks of up to 50 keys or 2 seconds; first/end/matched "
+                           "points checked against fresh multiplication."
+                         : ". Independent random key each attempt; repeats are allowed.") +
+          " Known results only verify a discovered match. Use /stop to cancel.");
+  } else
+    reply("Unknown command. Use /help.");
 }
-
 static void pollSerial() {
   static String line;
   while (Serial.available()) {
-    const char c = (char)Serial.read();
-    if (c == '\r' || c == '\n') {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
       if (!line.isEmpty()) {
-        Serial.println(String("> ") + line);
+        logLine("> " + line);
         handleCommand(line);
         line = "";
       }
-    } else if (line.length() < 160) {
+    } else if (line.length() < 160)
       line += c;
-    }
   }
 }
-
 #if !SERIAL_ONLY
 static void pollTelegram() {
-  if (WiFi.status() != WL_CONNECTED || String(TELEGRAM_BOT_TOKEN).length() < 20) return;
-  const uint32_t pollStartedMs = millis();
+  if (!credentialsPresent || WiFi.status() != WL_CONNECTED || time(nullptr) < 1700000000)
+    return;
   WiFiClientSecure client;
-  configureTls(client);
+  client.useBuiltinCACertBundle();
+  client.setHandshakeTimeout(15);
   HTTPClient http;
   http.setTimeout(10000);
-  String url = telegramUrl("getUpdates") + "?offset=" + String((long long)telegramOffset) + "&timeout=0&limit=5";
-  if (!http.begin(client, url)) return;
+  String url = String("https://api.telegram.org/bot") + TELEGRAM_BOT_TOKEN +
+               "/getUpdates?offset=" + String((long long)telegramOffset) + "&timeout=0&limit=5";
+  if (!http.begin(client, url))
+    return;
   const int code = http.GET();
-  const uint32_t pollDurationMs = millis() - pollStartedMs;
-  if (pollDurationMs >= 1000) {
-    logLine("Telegram poll HTTP " + String(code) + " took " + String(pollDurationMs) +
-      " ms; search pauses during polling.");
-  }
-  if (code != HTTP_CODE_OK) {
-    logLine("Telegram poll failed: HTTP " + String(code));
-    http.end();
-    return;
-  }
   JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, *http.getStreamPtr());
+  const bool ok = code == 200 && !deserializeJson(doc, http.getString()) && (doc["ok"] | false);
   http.end();
-  if (error) {
-    logLine("Telegram update parse failed: " + String(error.c_str()));
+  if (!ok) {
+    logLine("Telegram poll failed: HTTP " + String(code));
     return;
   }
-  JsonArray updates = doc["result"].as<JsonArray>();
-  for (JsonObject update : updates) {
-    int64_t updateId = update["update_id"] | -1;
-    if (updateId >= telegramOffset) telegramOffset = updateId + 1;
+  for (JsonObject update : doc["result"].as<JsonArray>()) {
+    int64_t id = update["update_id"] | -1;
+    if (id >= telegramOffset)
+      telegramOffset = id + 1;
     JsonObject message = update["message"];
-    if (message.isNull()) continue;
-    int64_t chatId = message["chat"]["id"] | 0;
-    if (chatId != strtoll(TELEGRAM_OWNER_CHAT_ID, nullptr, 10)) continue;
-    const char *incoming = message["text"] | "";
-    if (incoming[0] == '/') handleCommand(String(incoming));
+    if (message.isNull() ||
+        (message["chat"]["id"] | 0LL) != strtoll(TELEGRAM_OWNER_CHAT_ID, nullptr, 10))
+      continue;
+    const char *text = message["text"] | "";
+    if (text[0] == '/')
+      handleCommand(String(text));
   }
 }
 #endif
-
-static void reportFound(const uint8_t key[32], const String &address, bool compressed) {
-  pendingFoundMessage = "TARGET KEY FOUND\nPuzzle: " + String(puzzle.id) +
-    "\nAddress: " + address + "\nPrivate key (hex): " + bytesToHex(key, 32) +
-    "\nPrivate key (WIF): " + wifForPrivateKey(key, compressed) +
-    "\nChecked: " + String((unsigned long long)tries) + " candidates";
-  searching = false;
-  if (activeRunStartMs) accumulatedRunMs += millis() - activeRunStartMs;
-  activeRunStartMs = 0;
-  saveState(true);
-#if SERIAL_ONLY
-  logLine("TARGET KEY FOUND\nPuzzle: " + String(puzzle.id) +
-    "\nAddress: " + address + "\nPrivate key (hex): " + bytesToHex(key, 32) +
-    "\nPrivate key (WIF): " + wifForPrivateKey(key, compressed) +
-    "\nChecked: " + String((unsigned long long)tries) + " candidates");
-#else
-  if (sendTelegram(pendingFoundMessage)) {
-    pendingFoundMessage = "";
-    logLine("Target match found and sent to Telegram.");
-  } else {
-    logLine("Target match found; keeping the result in RAM and retrying Telegram delivery.");
-  }
+static void retryFound() {
+  if (!fsReady || !foundReady || !foundRecords.flush())
+    return;
+#if !SERIAL_ONLY
+  for (const auto &r : foundRecords.all())
+    if (r.pending) {
+      const uint16_t id = r.puzzle;
+      if (sendTelegram("TARGET KEY FOUND\n" + foundText(r))) {
+        if (!foundRecords.markDelivered(id))
+          logLine("Delivery succeeded; acknowledgment save will be retried.");
+      }
+      break; // Keep serial/search responsive when offline or many results are pending.
+    }
 #endif
+}
+static void reportFound(bool compressed) {
+  runStats.stop(millis());
+  searching = false;
+  walkReady = false;
+  btc::FoundRecord r;
+  r.puzzle = puzzle.id;
+  memcpy(r.key.data(), currentKey, 32);
+  r.compressed = compressed;
+  r.pending = !SERIAL_ONLY;
+  r.attempts = runStats.attempts;
+  r.elapsedMs = runStats.elapsedMs;
+  const bool saved = fsReady && foundRecords.put(r);
+  saveState(true);
+  logLine("TARGET KEY FOUND\n" + foundText(r));
+  if (!saved)
+    logLine("WARNING: result save failed; retained in RAM and will retry. Keep power connected.");
+  retryFound();
+  memset(currentKey, 0, 32);
 }
 
 static void searchOneCandidate() {
-  if (!searching || !puzzle.loaded) return;
-  uint8_t key[32];
-  if (!makeRandomPuzzleKey(puzzle.id, key)) {
-    searching = false;
+  if (!searching || !puzzle.loaded)
     return;
-  }
-  String matchedAddress;
   bool compressed = true;
-  ++tries;
-  saveState();
-  const bool found = testCandidate(key, matchedAddress, compressed);
-  blinkKeyChecked();
-  if (found) {
-    reportFound(key, matchedAddress, compressed);
-    memset(key, 0, sizeof(key));
+  keyLed(true);
+  btc::Check result = btc::Check::Error;
+  if (randomEveryKey) {
+    if (btc::randomKey(puzzle.id, currentKey, hardwareRng))
+      result = crypto.check(currentKey, puzzle.target, compressed);
+  } else {
+    if (!walkReady || uint32_t(millis() - chunkStartedMs) >= CHUNK_MS) {
+      walkReady = btc::randomKey(puzzle.id, currentKey, hardwareRng) && crypto.derive(currentKey);
+      chunkStartedMs = millis();
+      stepValidated = false;
+    }
+    if (walkReady)
+      result = crypto.checkCurrent(puzzle.target, compressed);
+  }
+  if (result == btc::Check::Error) {
+    keyLed(false);
+    runStats.stop(millis());
+    searching = false;
+    saveState(true);
+    reply("Search stopped: cryptographic operation failed. Attempt was not counted.");
     return;
   }
-  memset(key, 0, sizeof(key));
+  ++runStats.attempts;
+  if (result == btc::Check::Match) {
+    keyLed(false);
+    reportFound(compressed);
+    return;
+  }
+  if (!randomEveryKey) {
+    if (btc::maximumKey(puzzle.id, currentKey))
+      walkReady = false;
+    else {
+      bool advanced = crypto.increment();
+      for (int i = 31; i >= 0; --i)
+        if (++currentKey[i])
+          break;
+      if (advanced && !stepValidated) {
+        advanced = validatePoint(currentKey);
+        stepValidated = advanced;
+      }
+      if (!advanced) {
+        keyLed(false);
+        walkReady = false;
+        runStats.stop(millis());
+        searching = false;
+        saveState(true);
+        reply("Search stopped: incremental point validation/arithmetic failed.");
+        return;
+      }
+    }
+  }
+  keyLed(false);
+  runStats.tick(millis());
 }
-
 void setup() {
   Serial.begin(115200);
   delay(300);
-  logLine("ESP32 standalone BTC puzzle client starting.");
-  logLine("No pool requests or progress submissions are made.");
-#if !SERIAL_ONLY
-  if (!strcmp(WIFI_SSID, "YOUR_WIFI_NAME") || !strcmp(TELEGRAM_BOT_TOKEN, "PASTE_BOT_TOKEN_HERE") ||
-      !strcmp(TELEGRAM_OWNER_CHAT_ID, "PASTE_NUMERIC_CHAT_ID_HERE") ||
-      String(WIFI_SSID).isEmpty() || String(TELEGRAM_BOT_TOKEN).length() < 20 ||
-      String(TELEGRAM_OWNER_CHAT_ID).isEmpty()) {
-    logLine("Configure WIFI_SSID, WIFI_PASSWORD, TELEGRAM_BOT_TOKEN, and TELEGRAM_OWNER_CHAT_ID in secrets.h.");
+  logLine("ESP32 BTC puzzle client starting. No pool is used.");
+#if defined(LED_BUILTIN) && !defined(RGB_BUILTIN)
+  pinMode(LED_BUILTIN, OUTPUT);
+#endif
+  keyLed(false);
+#if SERIAL_ONLY
+  bootloader_random_enable(); // Supply fresh hardware entropy while radio is disabled; no ADC is
+                              // used.
+  logLine("SERIAL_ONLY=1: Wi-Fi/Telegram disabled. Hardware RNG entropy enabled.");
+#else
+  credentialsPresent = String(WIFI_SSID) != "YOUR_WIFI_NAME" && !String(WIFI_SSID).isEmpty() &&
+                       String(TELEGRAM_BOT_TOKEN).length() >= 20 &&
+                       String(TELEGRAM_BOT_TOKEN) != "PASTE_BOT_TOKEN_HERE" &&
+                       !String(TELEGRAM_OWNER_CHAT_ID).isEmpty() &&
+                       String(TELEGRAM_OWNER_CHAT_ID) != "PASTE_NUMERIC_CHAT_ID_HERE";
+  if (credentialsPresent) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+    logLine("Connecting Wi-Fi; Telegram uses authenticated TLS after time synchronization.");
+  } else {
+    bootloader_random_enable();
+    logLine(
+        "Configure secrets.h for Telegram; serial control and hardware entropy remain available.");
+  }
+#endif
+  if (!crypto.begin(hardwareRng)) {
+    logLine("secp256k1 initialization failed.");
     return;
   }
-  credentialsPresent = true;
-#else
-  logLine("SERIAL_ONLY=1: Wi-Fi and Telegram are disabled; no credentials are needed.");
-#endif
-
-  mbedtls_ecp_group_init(&secpGroup);
-  mbedtls_ecp_point_init(&publicPoint);
-  mbedtls_mpi_init(&privateScalar);
-  int ecpResult = mbedtls_ecp_group_load(&secpGroup, MBEDTLS_ECP_DP_SECP256K1);
-  if (ecpResult != 0) {
-    logLine("This Arduino core was built without secp256k1 support.");
-    return;
-  }
-  cryptoReady = true;
-
-#if !SERIAL_ONLY
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  logLine("Connecting to Wi-Fi...");
-  uint32_t wifiWait = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiWait < 30000) delay(250);
-  if (WiFi.status() == WL_CONNECTED) logLine("Wi-Fi connected.");
-  else logLine("Wi-Fi unavailable; embedded targets and serial control remain available.");
-#else
-  logLine("Wi-Fi was not started.");
-#endif
-  logLine("Serial console ready at 115200 baud. Type /help and press Enter.");
   loadState();
-  const bool resumeAfterBoot = searching;
-  if (savedPuzzleId > 0 && savedPuzzleId <= MAX_PUZZLE_ID) {
-    Puzzle loaded;
-    if (fetchPuzzle(savedPuzzleId, loaded)) {
-      puzzle = loaded;
-      logLine("Restored puzzle " + String(savedPuzzleId) + " target " + puzzle.address);
-      if (resumeAfterBoot && searching) {
-        reply("Search resumed after reboot.\nPuzzle: " + String(puzzle.id) +
-          "\nAttempts so far: " + String((unsigned long long)tries));
-      }
-    } else {
-      searching = false;
-      logLine("Could not restore selected puzzle; search remains stopped.");
-    }
+  if (!fsReady || !foundReady) {
+    searching = false;
+    runStats.stop(millis());
   }
-  reply("ESP32 BTC puzzle client online. No pool is used.\nSend /help.");
-  appReady = true;
-}
-
-void loop() {
-  if (!appReady) {
+  resetSpeedWindow();
+  ready = true;
+  if (searching) {
+    const String resumed = "Search resumed after reboot.\nPuzzle: " + String(puzzle.id) +
+                           "\nAttempts: " + String((unsigned long long)runStats.attempts);
+    logLine(resumed);
 #if !SERIAL_ONLY
-    if (credentialsPresent && cryptoReady && WiFi.status() != WL_CONNECTED &&
-        millis() - lastWifiReconnectMs >= 10000) {
-      lastWifiReconnectMs = millis();
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    }
+    pendingResumeMessage = resumed;
 #endif
-    delay(1000);
+  }
+  reply("ESP32 BTC puzzle client online. Use /help. Serial: 115200 baud.");
+}
+void loop() {
+  if (!ready) {
+    delay(100);
     return;
   }
+  runStats.tick(millis());
   pollSerial();
-#if !SERIAL_ONLY
-  if (WiFi.status() != WL_CONNECTED && millis() - lastWifiReconnectMs >= 10000) {
-    lastWifiReconnectMs = millis();
-    WiFi.reconnect();
-  }
-#endif
   const uint32_t now = millis();
 #if !SERIAL_ONLY
-  if (!pendingFoundMessage.isEmpty() && now - lastFoundRetryMs >= 10000) {
-    lastFoundRetryMs = now;
-    if (sendTelegram(pendingFoundMessage)) {
-      pendingFoundMessage = "";
-      logLine("Pending result delivered to Telegram.");
-    }
+  if (credentialsPresent && WiFi.status() != WL_CONNECTED && uint32_t(now - lastWifiMs) >= 10000) {
+    lastWifiMs = now;
+    WiFi.reconnect();
   }
-#endif
-  saveState();
-#if !SERIAL_ONLY
-  if (now - lastTelegramPollMs >= TELEGRAM_POLL_MS) {
-    lastTelegramPollMs = now;
+  if (uint32_t(now - lastTelegramMs) >= 10000) {
+    lastTelegramMs = now;
+    if (!pendingResumeMessage.isEmpty() && sendTelegram(pendingResumeMessage))
+      pendingResumeMessage = "";
     pollTelegram();
   }
 #endif
-  if (searching) {
+  if (uint32_t(now - lastFoundRetryMs) >= 10000) {
+    lastFoundRetryMs = now;
+    retryFound();
+  }
+  if (selftest.active)
+    selftestOneCandidate();
+  else if (searching)
     searchOneCandidate();
-    if (millis() - lastStatsMs >= STATS_LOG_MS) {
-      uint32_t elapsed = millis() - lastStatsMs;
-      uint64_t delta = tries - lastStatsTries;
-      double rate = elapsed ? (double)delta * 1000.0 / elapsed : 0.0;
-      logLine("Puzzle " + String(puzzle.id) + ": " + String((unsigned long long)tries) +
-              " attempts, " + String(rate, 2) + " candidates/s");
-      lastStatsTries = tries;
-      lastStatsMs = millis();
+  else
+    delay(5);
+  saveState();
+  if (uint32_t(millis() - lastLogMs) >= STATS_LOG_MS) {
+    if (selftest.active)
+      logLine("SELFTEST puzzle " + String(selftest.id) + ": " +
+              String((unsigned long long)selftest.stats.attempts) +
+              (selftest.walk ? " walk attempts." : " independent random attempts."));
+    else if (searching) {
+      const uint32_t elapsed = millis() - lastLogMs;
+      const double rate = elapsed ? double(runStats.attempts - lastLogTries) * 1000.0 / elapsed : 0;
+      logLine("Puzzle " + String(puzzle.id) + ": " + String((unsigned long long)runStats.attempts) +
+              " attempts, " + String(rate, 2) + " keys/s");
     }
-  } else {
-    delay(10);
+    resetSpeedWindow();
   }
 }
