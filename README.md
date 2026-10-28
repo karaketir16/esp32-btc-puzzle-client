@@ -8,7 +8,8 @@ This is a learning project, not a practical way to find a key. The ESP32 has no 
 
 - Telegram bot commands: `/help`, `/puzzle <ID>`, `/run`, `/stop`, and `/status`.
 - USB serial command interface, with the same commands (without the leading slash also accepted).
-- Public target metadata for puzzle IDs 1–10 embedded in the firmware; other puzzle metadata is fetched from `btcpuzzle.info`.
+- Public target addresses for all 160 puzzle IDs embedded in the firmware; ranges are computed locally.
+- Public puzzle-list URL included in puzzle/status replies for manual solved-status checks.
 - Local checks for compressed and uncompressed legacy P2PKH addresses.
 - LittleFS persistence for selected puzzle, candidate count, accumulated search time, and whether a search was active. An active search resumes after reboot. A sudden power loss may lose changes since the last checkpoint.
 - LED pulse while checking a candidate.
@@ -16,7 +17,9 @@ This is a learning project, not a practical way to find a key. The ESP32 has no 
 
 ## Hardware
 
-The sketch supports ESP32-S3 and ESP32-C3 Arduino targets. Select the exact board definition for your module where available. Example FQBNs:
+The sketch supports ESP32-S3 and ESP32-C3 Arduino targets. `SERIAL_ONLY` defaults to `0` (false), which enables Wi-Fi and Telegram. Set it to `1` to disable both and use USB serial only. Embedded targets and ranges work offline, so serial-only mode needs no Wi-Fi credentials or `secrets.h`. The firmware does not query the puzzle site for solved status; puzzle replies include its URL so you can check manually.
+
+Select the exact board definition for your module where available. Example FQBNs:
 
 | Board | Arduino FQBN |
 | --- | --- |
@@ -84,6 +87,20 @@ ESP32-C3 Super Mini (Nologo board definition):
 arduino-cli compile --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' .
 ```
 
+Serial-only C3 Super Mini build (Wi-Fi and Telegram disabled):
+
+```sh
+arduino-cli compile --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' --build-property 'compiler.cpp.extra_flags=-DSERIAL_ONLY=1' .
+```
+
+Flash that serial-only build with the same option:
+
+```sh
+arduino-cli upload -p /dev/cu.usbmodemXXXX --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' --build-property 'compiler.cpp.extra_flags=-DSERIAL_ONLY=1' .
+```
+
+Omit the build property for the default `SERIAL_ONLY=0` build. For an S3 serial-only build, use the S3 FQBN above with the same build property.
+
 To see installed board definitions, run `arduino-cli board listall esp32c3` or `arduino-cli board listall esp32s3`.
 
 ## Flash
@@ -132,7 +149,7 @@ The same commands can be sent to the configured Telegram bot. Choose a puzzle, t
 
 ## Puzzle ranges and limitations
 
-Puzzle `n` searches the inclusive range `[2^(n-1), 2^n - 1]`. The first ten public target addresses are embedded, so those IDs can be selected without fetching metadata. They are already solved; they are included so the standard selection and checking flow can be tried. For other IDs the program reads the public puzzle page; changes to that site's page format may require code updates.
+Puzzle `n` searches the inclusive range `[2^(n-1), 2^n - 1]`. Addresses for all 160 puzzles are embedded in `puzzle_metadata.h`, captured from the [public puzzle listing](https://btcpuzzle.info/puzzle). Targets work offline. The firmware does not fetch solved status; `/puzzle` and `/status` responses give you the listing URL to check manually. Update the embedded address list if the challenge adds puzzles or changes a target.
 
 The S3 performs secp256k1 operations in software. The C3 is slower still. The chip's cryptographic peripherals do not provide the secp256k1 point multiplication needed by this search, so this project should be treated as a demonstration and not a realistic strategy for finding a key.
 
