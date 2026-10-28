@@ -52,6 +52,14 @@ Copy `secrets.example.h` to `secrets.h`, then set your Wi-Fi name/password, Tele
 cp secrets.example.h secrets.h
 ```
 
+To find your chat ID, stop or unplug the ESP32 first so it does not compete with the script for Telegram updates. Send `/start` to your bot, then run:
+
+```sh
+python3 get_chat_id.py
+```
+
+The script reads the bot token from `TELEGRAM_BOT_TOKEN` in `secrets.h`; if that file is unavailable, it prompts for the token without displaying it. It waits up to 30 seconds for updates and prints the chat ID(s). The script uses only Python's standard library. If another bot client is polling at the same time, Telegram may return a conflict error; stop that client and retry.
+
 Puzzle solving can run without Telegram credentials, but Wi-Fi and Telegram features will be unavailable. Use a private Telegram chat: if a key is found, the program sends the private key and WIF in plaintext.
 
 ## Compile
