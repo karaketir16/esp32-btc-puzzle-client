@@ -90,13 +90,13 @@ arduino-cli compile --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' .
 Serial-only C3 Super Mini build (Wi-Fi and Telegram disabled):
 
 ```sh
-arduino-cli compile --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' --build-property 'compiler.cpp.extra_flags=-DSERIAL_ONLY=1' .
+arduino-cli compile --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' --build-property 'compiler.cpp.extra_flags=-DSERIAL_ONLY=1' --output-dir build/serial-only .
 ```
 
 Flash that serial-only build with the same option:
 
 ```sh
-arduino-cli upload -p /dev/cu.usbmodemXXXX --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' --build-property 'compiler.cpp.extra_flags=-DSERIAL_ONLY=1' .
+arduino-cli upload -p /dev/cu.usbmodemXXXX --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' --input-dir build/serial-only
 ```
 
 Omit the build property for the default `SERIAL_ONLY=0` build. For an S3 serial-only build, use the S3 FQBN above with the same build property.
