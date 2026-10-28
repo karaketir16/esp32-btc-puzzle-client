@@ -31,29 +31,42 @@ Select the exact board definition for your module where available. Example FQBNs
 | Generic ESP32-C3 Dev Module | `esp32:esp32:esp32c3` |
 | Nologo ESP32-C3 Super Mini | `esp32:esp32:nologo_esp32c3_super_mini` |
 
+The S3 example enables OPI PSRAM for the module used during development. If your S3 has no PSRAM or uses a different PSRAM type, select the matching option instead. For generic C3 boards using native USB, enable USB CDC on boot if the default board options do not expose sketch serial output.
+
 The Telegram build uses most of the default 1.25 MiB app partition within the 4 MB flash. Serial-only builds are considerably smaller. If a C3 board has a smaller flash chip or a different partition layout, the standard build may not fit.
 
-## Install Arduino CLI and board support
+## Get the source and install dependencies
 
-Install [Arduino CLI](https://arduino.github.io/arduino-cli/) and the Espressif Arduino core. Then install the JSON dependency:
+Arduino requires the sketch folder to match `esp32-btcpuzzle.ino`. Clone into the following folder name (the GitHub repository name differs):
+
+```sh
+git clone https://github.com/karaketir16/esp32-btc-puzzle-client.git esp32-btcpuzzle
+cd esp32-btcpuzzle
+```
+
+If you downloaded a ZIP, rename the extracted directory to `esp32-btcpuzzle` before compiling.
+
+Install [Arduino CLI](https://arduino.github.io/arduino-cli/). On macOS with Homebrew:
+
+```sh
+brew install arduino-cli
+```
+
+Initialize CLI configuration only if you do not already have one. Configure the ESP32 package index **before** installing the core:
 
 ```sh
 arduino-cli config init
+arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
 arduino-cli core update-index
 arduino-cli core install esp32:esp32@3.3.12
 arduino-cli lib install ArduinoJson@7.4.3
 ```
 
-If the ESP32 core's package index is not configured on a fresh CLI installation, add it first:
-
-```sh
-arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-arduino-cli core update-index
-```
+ArduinoJson is required even in serial-only mode. LittleFS and Mbed TLS come with the ESP32 core; no separate filesystem uploader is needed. Keep a LittleFS-compatible data partition (the tested default layout includes one). On the first boot, the firmware formats an erased data partition itself.
 
 ## Configure credentials
 
-Copy `secrets.example.h` to `secrets.h`, then set your Wi-Fi name/password, Telegram bot token, and numeric Telegram chat ID. The real `secrets.h` is ignored by Git and must not be committed or shared.
+Skip this section for `SERIAL_ONLY=1`. For Wi-Fi and Telegram, copy `secrets.example.h` to `secrets.h`, then set your Wi-Fi name/password, Telegram bot token, and numeric Telegram chat ID. The real `secrets.h` is ignored by Git and must not be committed or shared.
 
 ```sh
 cp secrets.example.h secrets.h
@@ -65,7 +78,7 @@ To find your chat ID, stop or unplug the ESP32 first so it does not compete with
 python3 get_chat_id.py
 ```
 
-The script reads the bot token from `TELEGRAM_BOT_TOKEN` in `secrets.h`; if that file is unavailable, it prompts for the token without displaying it. It waits up to 30 seconds for updates and prints the chat ID(s). The script uses only Python's standard library. If another bot client is polling at the same time, Telegram may return a conflict error; stop that client and retry.
+The script first checks the `TELEGRAM_BOT_TOKEN` environment variable, then the definition in `secrets.h`; if the selected value is missing or still a placeholder, it prompts without displaying it. It waits up to 30 seconds for updates and prints the chat ID(s). The script uses only Python's standard library. If another bot client is polling at the same time, Telegram may return a conflict error; stop that client and retry.
 
 Without Telegram credentials, serial control remains available. In `SERIAL_ONLY=1`, the radio is disabled and an ADC-based hardware entropy source is enabled; this project does not otherwise use the ADC. Found keys are stored unencrypted in device flash and are returned through serial and the configured Telegram chat.
 
@@ -76,31 +89,25 @@ Run these commands from the repository directory. Change the FQBN to match your 
 ESP32-S3 Super Mini:
 
 ```sh
-arduino-cli compile --fqbn 'esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi' .
+arduino-cli compile --fqbn 'esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi' --output-dir build/s3 .
 ```
 
 Generic ESP32-C3:
 
 ```sh
-arduino-cli compile --fqbn 'esp32:esp32:esp32c3' .
+arduino-cli compile --fqbn 'esp32:esp32:esp32c3' --output-dir build/c3 .
 ```
 
 ESP32-C3 Super Mini (Nologo board definition):
 
 ```sh
-arduino-cli compile --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' .
+arduino-cli compile --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' --output-dir build/c3-super-mini .
 ```
 
 Serial-only C3 Super Mini build (Wi-Fi and Telegram disabled):
 
 ```sh
 arduino-cli compile --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' --build-property 'compiler.cpp.extra_flags=-DSERIAL_ONLY=1' --output-dir build/serial-only .
-```
-
-Flash those compiled serial-only binaries:
-
-```sh
-arduino-cli upload -p /dev/cu.usbmodemXXXX --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' --input-dir build/serial-only
 ```
 
 Omit the build property for the default `SERIAL_ONLY=0` build. For an S3 serial-only build, use the S3 FQBN above with the same build property.
@@ -115,19 +122,35 @@ Connect the board by USB and find its serial port:
 arduino-cli board list
 ```
 
-On macOS, ports commonly look like `/dev/cu.usbmodem...` or `/dev/cu.wchusbserial...`. Replace the port and FQBN below with the ones for your board.
+On macOS, ports commonly look like `/dev/cu.usbmodem...` or `/dev/cu.wchusbserial...`. Linux ports commonly look like `/dev/ttyACM0` or `/dev/ttyUSB0`; Windows ports look like `COM3`. Replace the example port below with yours. Close any serial monitor before uploading.
+
+**Upload does not compile.** First run the matching compile command above, then upload from its output directory. Changing `SERIAL_ONLY`, credentials, or board options requires recompiling. `--build-property` belongs to `compile`, not `upload`.
 
 ESP32-S3 Super Mini:
 
 ```sh
-arduino-cli upload -p /dev/cu.usbmodemXXXX --fqbn 'esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi' .
+arduino-cli upload -p /dev/cu.usbmodemXXXX --fqbn 'esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi' --input-dir build/s3 .
 ```
 
 Generic ESP32-C3:
 
 ```sh
-arduino-cli upload -p /dev/cu.usbmodemXXXX --fqbn 'esp32:esp32:esp32c3' .
+arduino-cli upload -p /dev/cu.usbmodemXXXX --fqbn 'esp32:esp32:esp32c3' --input-dir build/c3 .
 ```
+
+ESP32-C3 Super Mini (Nologo), Wi-Fi and Telegram build:
+
+```sh
+arduino-cli upload -p /dev/cu.usbmodemXXXX --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' --input-dir build/c3-super-mini .
+```
+
+ESP32-C3 Super Mini (Nologo), serial-only build:
+
+```sh
+arduino-cli upload -p /dev/cu.usbmodemXXXX --fqbn 'esp32:esp32:nologo_esp32c3_super_mini' --input-dir build/serial-only .
+```
+
+A normal upload writes the bootloader, partition table, and application. It does not upload a LittleFS image. Keep the same partition layout to retain saved state; erasing all flash or changing partition boundaries can destroy it. After upload, tap RESET if the application does not start, and check the serial port again if USB re-enumerates.
 
 ### C3 native USB reset fallback
 
@@ -156,7 +179,7 @@ Open a serial monitor at 115200 baud:
 arduino-cli monitor -p /dev/cu.usbmodemXXXX --config baudrate=115200
 ```
 
-Enter commands such as:
+Use a terminal/monitor that sends a newline (LF or CRLF) when you press Enter. Enter commands such as:
 
 ```text
 help
@@ -169,13 +192,13 @@ found 10
 selftest 10
 ```
 
-The same commands can be sent to the configured Telegram bot. Choose a puzzle, then issue `run` to start local search. If a saved result already exists for that puzzle, it is reported immediately; clear that record before deliberately searching for it again. Use `status` to see local attempts and rate. Site-wide/pool statistics are not this board's progress.
+For Telegram, create a bot with [BotFather](https://t.me/BotFather), configure its token and your chat ID, then send `/start` to that bot. Use slash-prefixed commands there, such as `/puzzle 4` and `/run`. Choose a puzzle, then issue `run` to start local search. If a saved result already exists for that puzzle, it is reported immediately; clear that record before deliberately searching for it again. Use `status` to see local attempts and rate. Site-wide/pool statistics are not this board's progress.
 
 ## Puzzle ranges and limitations
 
 Puzzle `n` searches the inclusive range `[2^(n-1), 2^n - 1]`. Addresses for all 160 puzzles are embedded in `puzzle_metadata.h`, captured from the [public puzzle listing](https://btcpuzzle.info/puzzle). Targets work offline. The firmware does not fetch solved status; `/puzzle` and `/status` responses give you the listing URL to check manually. Update the embedded address list if the challenge adds puzzles or changes a target.
 
-The S3 performs secp256k1 operations in software. The C3 is slower still. The chip's cryptographic peripherals do not provide the secp256k1 point multiplication needed by this search, so this project should be treated as a demonstration and not a realistic strategy for finding a key.
+The S3 performs secp256k1 operations in software. Actual rates depend on the board, build, and search mode; the C3 measurements below do not establish an S3 comparison. The chip's cryptographic peripherals do not provide the secp256k1 point multiplication needed by this search, so this project should be treated as a demonstration and not a realistic strategy for finding a key.
 
 
 ## Search modes and device self-tests
@@ -238,7 +261,7 @@ This version uses `WiFiClientSecure::useBuiltinCACertBundle()` from Arduino ESP3
 
 The production modules are `search_core.*`, `checkpoint_store.*`, `found_records.*`, and `run_stats.h`. Tests compile these files directly, and additionally compile the actual sketch against small host serial/clock/filesystem adapters. They do not reproduce the curve algorithm in Python.
 
-Install CMake, a C++17 compiler, and OpenSSL development headers/libraries. CMake fetches checksummed Mbed TLS 3.6.6 unless `MBEDTLS_SOURCE_DIR` points to its source; it fetches checksummed ArduinoJson 7.4.3 unless `ARDUINOJSON_INCLUDE_DIR` points to its headers.
+Install CMake 3.20 or newer, a C++17 compiler, and OpenSSL development headers/libraries. On macOS with Homebrew, use `brew install cmake openssl@3`; if CMake cannot find OpenSSL, add `-DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"` to each configure command. CMake fetches checksummed Mbed TLS 3.6.6 unless `MBEDTLS_SOURCE_DIR` points to its source; it fetches checksummed ArduinoJson 7.4.3 unless `ARDUINOJSON_INCLUDE_DIR` points to its headers.
 
 ```sh
 cmake -S tests -B build/host-tests -DSANITIZERS=ON
@@ -252,10 +275,13 @@ ctest --test-dir build/host-tests32 --output-on-failure
 
 Tests cover differential curve checks against OpenSSL, 83 public solved keys, both public-key encodings, WIF, range boundaries, error reporting, independent random searches, interrupted/corrupted checkpoints, found-record reload/clear/notifications, clock rollover, stop/start accounting, commands, self-test pause/resume, 50-key and time restart caps, deliberate walk-point corruption detection, and legacy checkpoint migration. Sanitizers instrument the project code, not the separately built Mbed TLS library. Host platform adapters cannot establish physical flash behavior or a live Telegram connection; device checks complement them.
 
-For an optional automated serial diagnostic, install `pyserial` in a virtual environment and run:
+For an optional automated serial diagnostic, flash the serial-only build, close other serial monitors, then create a virtual environment and run (POSIX shell; on Windows activate with `build\serial-venv\Scripts\activate`):
 
 ```sh
-python3 tests/serial_selftest.py --port /dev/cu.usbmodemXXXX --id all --mode walk --timeout 900
+python3 -m venv build/serial-venv
+. build/serial-venv/bin/activate
+python -m pip install pyserial
+python tests/serial_selftest.py --port /dev/cu.usbmodemXXXX --id all --mode walk --timeout 900
 ```
 
 The script issues `/selftest all walk` (or use `--mode random`), checks the pass messages, verifies the original puzzle remains selected, and queries the saved result. It does not inject known keys into the solver.
